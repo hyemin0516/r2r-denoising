@@ -1,0 +1,42 @@
+# .gitignore 파일 내용
+__pycache__/
+.venv/
+.ipynb_checkpoints/
+
+# 로컬 로그 및 체크포인트 제외
+ckpts/
+wandb/
+
+# 대용량 파일 확장자 통째로 제외
+*.ckpt
+*.pth
+*.pt
+*.log
+
+# Backup and Copy scripts
+gr2r/train_cr2r-backup-hrda.py
+gr2r/train_cr2r-backup-res.py
+gr2r/train_cr2r-backup.py
+gr2r/train_cr2r-backup_dp.py
+gr2r/train_cr2r-backup_v10.py
+gr2r/train_cr2r-backup_v11.py
+gr2r/train_cr2r-backup_v2.py
+gr2r/train_cr2r-backup_v3.py
+gr2r/train_cr2r-backup_v4.py
+gr2r/train_cr2r-backup_v5.py
+gr2r/train_cr2r-backup_v6.py
+gr2r/train_cr2r-backup_v8.py
+gr2r/train_cr2r-backup_v9.py
+gr2r/train_ema_gr2r.py
+gr2r/train_gr2r.py
+gr2r/train_pdgr2r.py
+gr2r/train_pdgr2r_shift.py
+gr2r/train_pngr2r-Copy1.py
+gr2r/train_pngr2r-Copy2.py
+gr2r/train_pngr2r.py
+gr2r/train_pngr2r_cons-Copy1.py
+gr2r/train_pngr2r_cons.py
+gr2r/train_pngr2r_v2.py
+gr2r/train_pngr2r_val.py
+gr2r/train_regr2r-Copy1.py
+gr2r/train_regr2r.py

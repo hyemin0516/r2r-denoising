@@ -1,0 +1,52 @@
+model:
+  name: "unet"                                                # autoencoder | dncnn | drunet | unet
+  checkpoint: None       # "/workspace02/.../best.ckpt" (없으면 null)
+
+# 2. 데이터 및 학습 설정 (Data & Training)
+data:
+  img_size: 256          # Crop size
+  batch_size: 32
+  num_workers: 4
+
+train:
+  max_epochs: 300
+  lr: 2e-5    # LR
+  loss_type: "cbl"       # cbl | l1 | mse (기본 Loss)
+  wd: 0
+
+# 3. R2R (Rec2Rec) 핵심 파라미터
+r2r:
+  alpha: 0.5             # 노이즈 믹싱 비율 (중요! 0.1~0.2 추천)
+  noise_dist: "gaussian" # gaussian | poisson | gamma
+  noise_level: 0.05      # 초기 노이즈 레벨 (dist 관련)
+  edge_sensitivity: 2.0
+  
+  # Sigma Map 추정 관련
+  sigma_mode: "fixed"    # fixed | estimated
+  sigma_value: 1.5       # 전체 스케일링 팩터 (Smart Sigma 결과에 곱해짐)
+  
+  mc_samples: 5          # 몬테카를로 샘플링 수
+  pd_stride: 4           # Pixel Unshuffle Stride (Grid 커널과 맞춰야 함)
+
+# 4. [New!] 격자 주입 및 제거 (Grid Injection & Removal)
+# 박사님의 SIDD 실험을 위해 새로 추가된 섹션입니다.
+grid:
+  use: true
+  intensity_range: [0.1, 0.2]     # 격자 강도 (과장된 타겟을 위해 상향!)
+  amplification: 2.0
+  threshold: 0.02 #0.02
+  penalty_factor: 3.0
+  edge_penalty_factor: 5.0
+
+  
+loss:
+  consistency_weight: 20 # Consistency Loss 가중치
+  weight_full: 1.0
+
+# solver:
+#   step_lr: [3000, 6000]
+
+solver:
+  max_steps: 10000
+  warmup_steps: 2000      # [추가] 전체 300 epoch 중 5% 구간 웜업
+  min_lr: 1e-6

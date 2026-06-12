@@ -1,0 +1,85 @@
+model:
+  name: "unet"                                                # autoencoder | dncnn | drunet | unet
+  checkpoint: '/hyemin/denoising/ckpts/p2nr2r/lr0.0001_sv3.0_r2r_test_tv0.5_v2/best-psnr-step=03700-val_psnr=33.65.ckpt'        # "/workspace02/.../best.ckpt" (없으면 null)
+  # checkpoint: '/hyemin/denoising/ckpts/p2nr2r/lr0.0001_lossmse_dncnn/best-psnr-step=03900-val_psnr=33.16.ckpt'
+  # checkpoint: '/hyemin/denoising/ckpts/pcr2r/lr0.0001_loss_typemse_unet_sv3.0_v2/best-psnr-step=03200-val_psnr=33.15.ckpt'
+
+# 2. 데이터 및 학습 설정 (Data & Training)
+data:
+  img_size: 256          # Crop size
+  batch_size: 8
+  num_workers: 4
+
+train:
+  max_epochs: 300
+
+# 3. R2R (Rec2Rec) 핵심 파라미터
+r2r:
+  alpha: 0.5             # 노이즈 믹싱 비율 (중요! 0.1~0.2 추천)
+  noise_dist: "gaussian" # gaussian | poisson | gamma
+  noise_level: 0.05      # 초기 노이즈 레벨 (dist 관련)
+  edge_sensitivity: 2.0
+  use_learned_estimator: False
+  
+  # Sigma Map 추정 관련
+  sigma_mode: "fixed"    # fixed | estimated
+  sigma_value: 3.0       # 전체 스케일링 팩터 (Smart Sigma 결과에 곱해짐)
+  sv_input_trg: 1.0
+  
+  mc_samples: 5          # 몬테카를로 샘플링 수
+  pd_stride: 4           # Pixel Unshuffle Stride (Grid 커널과 맞춰야 함)
+
+# 4. [New!] 격자 주입 및 제거 (Grid Injection & Removal)
+# 박사님의 SIDD 실험을 위해 새로 추가된 섹션입니다.
+grid:
+  use: true
+  intensity_range: [0.1, 0.2]     # 격자 강도 (과장된 타겟을 위해 상향!)
+  amplification: 2.0
+  threshold: 0.02 #0.02
+  penalty_factor: 3.0
+  edge_penalty_factor: 5.0
+
+  
+loss:
+  consistency_weight: 20 # Consistency Loss 가중치
+  weight_full: 1.0
+
+# solver:
+#   step_lr: [3000, 6000]
+
+solver:
+  lr: 5e-5    # LR
+  loss_type: "mse"
+  wd: 1e-6
+  max_steps: 50000
+  lr_steps: [30000, 40000] # [1000, 3000, 5000] # [8000, 15000] 
+  warmup_steps: 2000      # [추가] 전체 300 epoch 중 5% 구간 웜업
+  min_lr: 1e-6
+  w_src: 1.0
+  w_uda: 1.0
+  w_cons: 1.0
+  w_mic: 0.1
+  w_feat: 0.1
+  w_dcs: 0.3
+  w_distill: 1.0
+  w_anchor: 0.5
+  w_est: 1e-3
+  w_phase: 0.003
+  beta: 0.0
+  conf_scale: 3000
+  # sim_thd: 0.02
+  conf_thd: 0.7
+  cons_scale: 40.0
+  
+
+uda:
+  rampup_starts: 500
+  rampup_ends: 5000
+  max_weight: 0.5
+  momentum: 0.99
+
+consistency:
+  rampup_starts: 2000
+  rampup_ends: 12000
+  max_weight: 1.5
+
