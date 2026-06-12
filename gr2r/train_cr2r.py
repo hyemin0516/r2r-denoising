@@ -615,6 +615,7 @@ class PD_GR2R(L.LightningModule):
             teacher_pd = pred_mc_clean
             base_idx = torch.randint(0, len(mc_preds), (1,)).item()
             base_pd = mc_preds[base_idx].detach()
+
             
             # confidence map smoothing
             y_pad = F.pad(y, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
@@ -635,6 +636,21 @@ class PD_GR2R(L.LightningModule):
 
             min_gate = 0.3
             noise_gate = min_gate + (1.0 - min_gate) * conf_smooth
+
+            # 새 base target only refinement
+            teacher_pd_refined = refine_pd_with_full_anchor(
+                teacher_pd=teacher_pd,
+                teacher_full=teacher_full,
+                gate=noise_gate,
+                gamma=0.3,
+                lp_kernel=15,
+            )
+            
+            teacher_pd_base_padded = F.pad(
+                teacher_pd_refined,
+                (pad, pad, pad, pad),
+                mode='reflect'
+            )
 
             # n_hat residual
             n_hat_full = y - teacher_full
@@ -741,10 +757,10 @@ class PD_GR2R(L.LightningModule):
             n_mixed_4 = alpha * n_hat_pd + beta * n_new_4
             
             # 5. 타겟 생성 (Blur 없는 teacher_full을 베이스로 사용)
-            source_pos2 = (base_pd + sigma_3 * noise_gate * n_mixed_1)
-            source_neg2 = (base_pd - sigma_4 * noise_gate * n_mixed_2)
-            source_pos3 = (base_pd + sigma_5 * noise_gate * n_mixed_3)
-            source_neg3 = (base_pd - sigma_6 * noise_gate * n_mixed_4)
+            source_pos2 = (teacher_pd_refined + sigma_3 * noise_gate * n_mixed_1)
+            source_neg2 = (teacher_pd_refined - sigma_4 * noise_gate * n_mixed_2)
+            source_pos3 = (teacher_pd_refined + sigma_5 * noise_gate * n_mixed_3)
+            source_neg3 = (teacher_pd_refined - sigma_6 * noise_gate * n_mixed_4)
 
             # type 3: Zero-Artifact Extrapolation + frequency-mixed artifact direction
             artifact_delta = teacher_pd - teacher_full
@@ -805,20 +821,7 @@ class PD_GR2R(L.LightningModule):
             
             # Padded matched_target
             # matched_target_padded = teacher_pd_padded.clone()
-            # 새 base target only refinement
-            teacher_pd_refined = refine_pd_with_full_anchor(
-                teacher_pd=teacher_pd,
-                teacher_full=teacher_full,
-                gate=noise_gate,
-                gamma=0.3,
-                lp_kernel=15,
-            )
-            
-            teacher_pd_base_padded = F.pad(
-                teacher_pd_refined,
-                (pad, pad, pad, pad),
-                mode='reflect'
-            )
+
             matched_target_padded = teacher_pd_base_padded.clone()
             selection_mask_padded = torch.zeros(B, 1, H_pad, W_pad, device=y.device)
             
