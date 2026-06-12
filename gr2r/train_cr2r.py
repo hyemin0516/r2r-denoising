@@ -110,24 +110,29 @@ class CharbonnierLoss(torch.nn.Module):
             return loss
         return torch.mean(loss)
 
-def extract_grid_pattern(image, stride=2):
-    """
-    이미지에서 격자 패턴(Artifact)만 추출하여 반환
-    """
-    b, c, h, w = image.shape
-    unshuffled = image.view(b, c, h // stride, stride, w // stride, stride)
-    local_mean = unshuffled.mean(dim=(3, 5), keepdim=True)
-    deviation = unshuffled - local_mean
-    
-    # 편차에서 텍스처 제거하고 격자만 남김 (Low Pass Filter)
-    dev_flat = deviation.permute(0, 1, 3, 5, 2, 4).reshape(-1, 1, h // stride, w // stride)
-    n_grid_flat = F.avg_pool2d(dev_flat, kernel_size=3, stride=1, padding=1)
-    
-    # 격자 패턴 복원
-    n_grid = n_grid_flat.view(b, c, stride, stride, h // stride, w // stride).permute(0, 1, 4, 2, 5, 3)
-    n_grid_full = n_grid.reshape(b, c, h, w)
-    
-    return n_grid_full
+def avg_pool_reflect(x, kernel_size):
+    pad = kernel_size // 2
+    x = F.pad(x, (pad, pad, pad, pad), mode="reflect")
+    return F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=0)
+
+
+def refine_pd_with_full_anchor(
+    teacher_pd,
+    teacher_full,
+    gate,
+    gamma=0.3,
+    lp_kernel=15,
+):
+    # PD-Full difference
+    delta = teacher_pd - teacher_full
+
+    # remove low-frequency color/context shift
+    delta_low = avg_pool_reflect(delta, lp_kernel)
+    delta_hp = delta - delta_low
+
+    # full context + gated PD detail
+    refined = teacher_full + gamma * gate * delta_hp
+    return refined.clamp(0, 1)
 
 def calc_normalized_gram_matrix(feat):
     """공간 해상도에 무관하게 질감 통계량만 추출하는 정규화된 그람 행렬"""
@@ -784,7 +789,7 @@ class PD_GR2R(L.LightningModule):
             # ====== Padding 추가 ======
             # 모든 sources와 mask를 mirror padding
             sources_padded = [F.pad(s, (pad, pad, pad, pad), mode='reflect') for s in sources]
-            teacher_pd_padded = F.pad(teacher_pd, (pad, pad, pad, pad), mode='reflect')
+            # teacher_pd_padded = F.pad(teacher_pd, (pad, pad, pad, pad), mode='reflect')
             conf_smooth_padded = F.pad(conf_smooth, (pad, pad, pad, pad), mode='reflect')
             
             H_pad = H + 2 * pad
@@ -799,7 +804,22 @@ class PD_GR2R(L.LightningModule):
             offset_w = torch.randint(0, patch_size, (1,)).item()
             
             # Padded matched_target
-            matched_target_padded = teacher_pd_padded.clone()
+            # matched_target_padded = teacher_pd_padded.clone()
+            # 새 base target only refinement
+            teacher_pd_refined = refine_pd_with_full_anchor(
+                teacher_pd=teacher_pd,
+                teacher_full=teacher_full,
+                gate=noise_gate,
+                gamma=0.3,
+                lp_kernel=15,
+            )
+            
+            teacher_pd_base_padded = F.pad(
+                teacher_pd_refined,
+                (pad, pad, pad, pad),
+                mode='reflect'
+            )
+            matched_target_padded = teacher_pd_base_padded.clone()
             selection_mask_padded = torch.zeros(B, 1, H_pad, W_pad, device=y.device)
             
             for b in range(B):
@@ -829,12 +849,26 @@ class PD_GR2R(L.LightningModule):
                         cy_e = min(H_pad, cy_val + half)
                         cx_s = max(0, cx_val - half)
                         cx_e = min(W_pad, cx_val + half)
+
+                        source_patch = source[b, :, cy_s:cy_e, cx_s:cx_e]
+                        base_patch = teacher_pd_base_padded[b, :, cy_s:cy_e, cx_s:cx_e]
+
+                        if conf_val < 0.45:
+                            src_w = 0.5
+                        elif conf_val < 0.70:
+                            src_w = 0.75
+                        else:
+                            src_w = 1.0
             
                         matched_target_padded[b, :, cy_s:cy_e, cx_s:cx_e] = \
                             source[b, :, cy_s:cy_e, cx_s:cx_e]
                         selection_mask_padded[b, 0, cy_s:cy_e, cx_s:cx_e] = 1
             
-            # Crop back to original size
+                        matched_target_padded[b, :, cy_s:cy_e, cx_s:cx_e] = \
+                            src_w * source_patch + (1.0 - src_w) * base_patch
+            
+                        selection_mask_padded[b, 0, cy_s:cy_e, cx_s:cx_e] = 1
+                        
             matched_target = matched_target_padded[:, :, pad:pad+H, pad:pad+W]
             selection_mask = selection_mask_padded[:, :, pad:pad+H, pad:pad+W]
             
