@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -669,21 +670,21 @@ class PD_GR2R(L.LightningModule):
             n_hat_pd_cross2 = n_hat_pd[perm4]
 
             # frequency_band_mixup
-            n_hat_full_cross1 = apply_residual_frequency_band_mixup(
-                n_hat_full_cross1,
-                low_range=(0.2, 0.8),
-                mid_range=(0.7, 1.3),
-                high_range=(0.8, 1.5),
-                renorm=True,
-            )
+            # n_hat_full_cross1 = apply_residual_frequency_band_mixup(
+            #     n_hat_full_cross1,
+            #     low_range=(0.2, 0.8),
+            #     mid_range=(0.7, 1.3),
+            #     high_range=(0.8, 1.5),
+            #     renorm=True,
+            # )
             
-            n_hat_full_cross2 = apply_residual_frequency_band_mixup(
-                n_hat_full_cross2,
-                low_range=(0.2, 0.8),
-                mid_range=(0.7, 1.3),
-                high_range=(0.8, 1.5),
-                renorm=True,
-            )
+            # n_hat_full_cross2 = apply_residual_frequency_band_mixup(
+            #     n_hat_full_cross2,
+            #     low_range=(0.2, 0.8),
+            #     mid_range=(0.7, 1.3),
+            #     high_range=(0.8, 1.5),
+            #     renorm=True,
+            # )
 
             def get_light_sigma(batch_size, device, min_val=0.05, max_val=0.15):
                 return (max_val - min_val) * torch.rand(batch_size, 1, 1, 1, device=device) + min_val
@@ -978,7 +979,7 @@ class PD_GR2R(L.LightningModule):
         G_src_grouped = G_src_batch.reshape(b_original, stride * stride, c_gram, c_gram)
         G_center = G_src_grouped.mean(dim=1, keepdim=True)
         loss_gram = torch.nn.functional.l1_loss(G_src_grouped, G_center.expand_as(G_src_grouped))
-        w_gram = 1e6
+        w_gram = 1e5
 
         # phase consistency
         loss_phase = pd_subpatch_phase_mean_loss(
@@ -1398,7 +1399,8 @@ def main():
         log_model=False,
         # W&B에 YAML config 전체를 업로드해서 나중에 하이퍼파라미터 추적하기 쉽게 만들기
         config=OmegaConf.to_container(cfg, resolve=True),
-        save_code=True
+        save_code=True,
+        settings=wandb.Settings(code_dir=os.getcwd()),
     )
 
     # 7. 트레이너 실행
