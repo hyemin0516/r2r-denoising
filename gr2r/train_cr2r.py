@@ -237,11 +237,11 @@ class PD_GR2R(L.LightningModule):
         # )
 
         # cosine_steps = total_steps - warmup_steps
-        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #     optimizer,
-        #     T_max=self.cfg.solver.max_steps,  # 예: 100
-        #     eta_min=self.cfg.solver.min_lr  # 최소 LR (0이 되지 않게 안전장치)
-        # )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.cfg.solver.max_steps,  # 예: 100
+            eta_min=self.cfg.solver.min_lr  # 최소 LR (0이 되지 않게 안전장치)
+        )
 
         # scheduler = torch.optim.lr_scheduler.SequentialLR(
         #     optimizer, 
@@ -249,11 +249,11 @@ class PD_GR2R(L.LightningModule):
         #     milestones=[warmup_steps]
         # )
         
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                optimizer,
-                milestones=self.cfg.solver.lr_steps,  
-                gamma=0.5                        
-        )  
+        # scheduler = torch.optim.lr_scheduler.MultiStepLR(
+        #         optimizer,
+        #         milestones=self.cfg.solver.lr_steps,  
+        #         gamma=0.5                        
+        # )  
 
 
         return {

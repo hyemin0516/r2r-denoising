@@ -48,11 +48,11 @@ loss:
 #   step_lr: [3000, 6000]
 
 solver:
-  lr: 5e-5    # LR
+  lr: 1e-4    # LR
   loss_type: "mse"
-  wd: 1e-6
+  wd: 1e-5
   max_steps: 50000
-  lr_steps: [45000] # [1000, 3000, 5000] # [8000, 15000] 
+  lr_steps: [30000, 40000] # [1000, 3000, 5000] # [8000, 15000] 
   warmup_steps: 2000      # [추가] 전체 300 epoch 중 5% 구간 웜업
   min_lr: 1e-6
   w_src: 1.0
