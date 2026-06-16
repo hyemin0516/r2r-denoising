@@ -837,12 +837,13 @@ class PD_GR2R(L.LightningModule):
                         # confidence-aware source routing
                         conf_val = conf_smooth_padded[b, 0, cy_val, cx_val].item()
             
-                        if conf_val < 0.45:
-                            candidate_indices = [2, 3, 4, 5]
-                        elif conf_val < 0.70:
-                            candidate_indices = [2, 3, 4, 5, 6, 7]
-                        else:
-                            candidate_indices = list(range(len(sources_padded)))
+                        # if conf_val < 0.45:
+                        #     candidate_indices = [2, 3, 4, 5]
+                        # elif conf_val < 0.70:
+                        #     candidate_indices = [2, 3, 4, 5, 6, 7]
+                        # else:
+                        #     candidate_indices = list(range(len(sources_padded)))
+                        candidate_indices = list(range(len(sources_padded)))
             
                         src_idx = candidate_indices[
                             torch.randint(0, len(candidate_indices), (1,)).item()
@@ -945,6 +946,7 @@ class PD_GR2R(L.LightningModule):
         y1_sub = (y_sub_pad + heavy_noise).clamp(0, 1)
         y2_sub_pad = (y_sub_pad - target_noise).clamp(0, 1)
         y2_sub = y2_sub_pad[..., pad_size:-pad_size, pad_size:-pad_size]
+        y2_sub_full = pixel_shuffle(y2_sub, self.cfg.r2r.pd_stride)
         
         # Student 예측
         src_residual_pad, src_feat_pad = self.student(y1_sub.clamp(0, 1), return_features='enc')
@@ -952,6 +954,7 @@ class PD_GR2R(L.LightningModule):
 
         src_residual = src_residual_pad[..., pad_size:-pad_size, pad_size:-pad_size]
         src_pred = src_pred_pad[..., pad_size:-pad_size, pad_size:-pad_size]
+        src_pred_full = pixel_shuffle(src_pred, self.cfg.r2r.pd_stride)
 
         # src_residual = self.student(y1_sub.clamp(0, 1))
         # src_pred = src_residual + y1_sub.clamp(0, 1)
@@ -968,6 +971,15 @@ class PD_GR2R(L.LightningModule):
 
         # loss_gram = torch.nn.functional.mse_loss(G_src, G_trg.detach())
         # w_gram = self.cfg.solver.w_feat
+        # source target consistency
+        loss_src_cons_map = F.smooth_l1_loss(
+            src_pred_full,
+            teacher_pd_refined.detach(),
+            reduction='none'
+        )
+        loss_src_cons = loss_src_cons_map.mean()
+        w_src_cons = 0.05
+
         # gram-consistency
         _, _, H_padded, _ = y1_sub.shape
         G_src_batch = crop_and_get_gram(src_feat_pad, H_padded, pad_size)
@@ -989,12 +1001,13 @@ class PD_GR2R(L.LightningModule):
         w_phase = self.cfg.solver.w_phase
         
         # Main PD Loss
-        src_loss_main = self.r2r_loss(src_pred, y2_sub)
-        src_loss = src_loss_main + (loss_gram * w_gram) + (loss_phase * w_phase)
+        src_loss_main = self.r2r_loss(src_pred_full, y2_sub_full)
+        src_loss = src_loss_main + (loss_gram * w_gram) + (loss_phase * w_phase) + (loss_src_cons * w_src_cons)
         # src_loss = src_loss_main
         self.log('src_loss', src_loss, on_step=True, logger=True)
         self.log('gram_loss',loss_gram*w_gram, on_step=True)
         self.log('phase_loss',loss_phase * w_phase, on_step=True)
+        self.log('src-cons_loss',loss_src_cons * w_src_cons, on_step=True)
         # self.log('debug/mc_boost_mean', mc_boost.mean(), on_step=True)
         # self.log('debug/mc_boost_max', mc_boost.max(), on_step=True)
             
