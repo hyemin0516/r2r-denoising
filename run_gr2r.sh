@@ -4,7 +4,7 @@ set -euo pipefail
 PROJECT_ROOT="/hyemin/denoising"
 cd "${PROJECT_ROOT}" || { echo "Project root not found!"; exit 1; }
 
-export CUDA_VISIBLE_DEVICES=2
+export CUDA_VISIBLE_DEVICES=0
 
 # =================================================================
 # 1. 실험 설정
@@ -13,7 +13,7 @@ export CUDA_VISIBLE_DEVICES=2
 # CONFIG_FILE="configs/exp7.yaml"
 # VER="m0.99_ign_src_inter-gram_phase_fda_v2""
 CONFIG_FILE="configs/exp10_lr3e5_sv5.0.yaml"
-VER="exp_routing-off_src-cons"
+VER="exp_best-mc-consistency"
 CKPT_ROOT="/hyemin/denoising/ckpts/pcr2r"
 
 # =================================================================

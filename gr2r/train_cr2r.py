@@ -639,19 +639,19 @@ class PD_GR2R(L.LightningModule):
             noise_gate = min_gate + (1.0 - min_gate) * conf_smooth
 
             # 새 base target only refinement
-            teacher_pd_refined = refine_pd_with_full_anchor(
-                teacher_pd=teacher_pd,
-                teacher_full=teacher_full,
-                gate=noise_gate,
-                gamma=0.3,
-                lp_kernel=15,
-            )
+            # teacher_pd_refined = refine_pd_with_full_anchor(
+            #     teacher_pd=teacher_pd,
+            #     teacher_full=teacher_full,
+            #     gate=noise_gate,
+            #     gamma=0.3,
+            #     lp_kernel=15,
+            # )
             
-            teacher_pd_base_padded = F.pad(
-                teacher_pd_refined,
-                (pad, pad, pad, pad),
-                mode='reflect'
-            )
+            # teacher_pd_base_padded = F.pad(
+            #     teacher_pd_refined,
+            #     (pad, pad, pad, pad),
+            #     mode='reflect'
+            # )
 
             # n_hat residual
             n_hat_full = y - teacher_full
@@ -758,10 +758,10 @@ class PD_GR2R(L.LightningModule):
             n_mixed_4 = alpha * n_hat_pd + beta * n_new_4
             
             # 5. 타겟 생성 (Blur 없는 teacher_full을 베이스로 사용)
-            source_pos2 = (teacher_pd_refined + sigma_3 * noise_gate * n_mixed_1)
-            source_neg2 = (teacher_pd_refined - sigma_4 * noise_gate * n_mixed_2)
-            source_pos3 = (teacher_pd_refined + sigma_5 * noise_gate * n_mixed_3)
-            source_neg3 = (teacher_pd_refined - sigma_6 * noise_gate * n_mixed_4)
+            source_pos2 = (base_pd + sigma_3 * noise_gate * n_mixed_1)
+            source_neg2 = (base_pd - sigma_4 * noise_gate * n_mixed_2)
+            source_pos3 = (base_pd + sigma_5 * noise_gate * n_mixed_3)
+            source_neg3 = (base_pd - sigma_6 * noise_gate * n_mixed_4)
 
             # type 3: Zero-Artifact Extrapolation + frequency-mixed artifact direction
             artifact_delta = teacher_pd - teacher_full
@@ -806,7 +806,7 @@ class PD_GR2R(L.LightningModule):
             # ====== Padding 추가 ======
             # 모든 sources와 mask를 mirror padding
             sources_padded = [F.pad(s, (pad, pad, pad, pad), mode='reflect') for s in sources]
-            # teacher_pd_padded = F.pad(teacher_pd, (pad, pad, pad, pad), mode='reflect')
+            teacher_pd_padded = F.pad(teacher_pd, (pad, pad, pad, pad), mode='reflect')
             conf_smooth_padded = F.pad(conf_smooth, (pad, pad, pad, pad), mode='reflect')
             
             H_pad = H + 2 * pad
@@ -823,7 +823,7 @@ class PD_GR2R(L.LightningModule):
             # Padded matched_target
             # matched_target_padded = teacher_pd_padded.clone()
 
-            matched_target_padded = teacher_pd_base_padded.clone()
+            matched_target_padded = teacher_pd_padded.clone()
             selection_mask_padded = torch.zeros(B, 1, H_pad, W_pad, device=y.device)
             
             for b in range(B):
@@ -956,29 +956,37 @@ class PD_GR2R(L.LightningModule):
         src_pred = src_pred_pad[..., pad_size:-pad_size, pad_size:-pad_size]
         src_pred_full = pixel_shuffle(src_pred, self.cfg.r2r.pd_stride)
 
-        # src_residual = self.student(y1_sub.clamp(0, 1))
-        # src_pred = src_residual + y1_sub.clamp(0, 1)
-
-        # src_pred = src_pred_pad[..., pad_size:-pad_size, pad_size:-pad_size]
-        
-        # gram-consistency
-        # scale_factor = y_sub_pad.shape[2] // src_feat_pad.shape[2]
-        # feat_pad = pad_size // scale_factor
-
-        # src_feat = src_feat_pad[..., feat_pad:-feat_pad, feat_pad:-feat_pad]
-        # src_feat_restored = pixel_shuffle(src_feat, self.cfg.r2r.pd_stride)
-        # G_src = calc_normalized_gram_matrix(src_feat_restored)
-
-        # loss_gram = torch.nn.functional.mse_loss(G_src, G_trg.detach())
-        # w_gram = self.cfg.solver.w_feat
         # source target consistency
+        full_low = avg_pool_reflect(teacher_full.detach(), 15)
+        
+        scores = []
+        for k in range(K):
+            pd_low = avg_pool_reflect(mc_preds[k].detach(), 15)
+            score = (pd_low - full_low).abs().mean(dim=(1, 2, 3))  # [B]
+            scores.append(score)
+        
+        scores = torch.stack(scores, dim=0)  # [K, B]
+        best_idx = scores.argmin(dim=0)      # [B]
+
+        if isinstance(mc_preds, (list, tuple)):
+            mc_stack = torch.stack([p.detach() for p in mc_preds], dim=0)  # [K, B, C, H, W]
+        else:
+            mc_stack = mc_preds.detach()  # 이미 [K, B, C, H, W]라고 가정
+        
+        B = mc_stack.shape[1]
+        batch_idx = torch.arange(B, device=mc_stack.device)
+        
+        # best_idx[b]에 해당하는 MC sample을 batch별로 선택
+        src_label_full = mc_stack[best_idx, batch_idx]  # [B, C, H, W]
+        src_label_full = src_label_full.detach()
+
         loss_src_cons_map = F.smooth_l1_loss(
             src_pred_full,
-            teacher_pd_refined.detach(),
+            src_label_full,
             reduction='none'
         )
         loss_src_cons = loss_src_cons_map.mean()
-        w_src_cons = 0.05
+        w_src_cons = 0.25
 
         # gram-consistency
         _, _, H_padded, _ = y1_sub.shape
