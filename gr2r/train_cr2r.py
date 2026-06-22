@@ -116,6 +116,28 @@ def avg_pool_reflect(x, kernel_size):
     x = F.pad(x, (pad, pad, pad, pad), mode="reflect")
     return F.avg_pool2d(x, kernel_size=kernel_size, stride=1, padding=0)
 
+def highpass(x, kernel_size=15):
+    return x - avg_pool_reflect(x, kernel_size)
+
+def fft_phase_loss(pred, ref, hp_kernel=15, eps=1e-8):
+    pred_hp = highpass(pred, hp_kernel)
+    ref_hp = highpass(ref.detach(), hp_kernel)
+
+    Fp = torch.fft.rfft2(pred_hp, norm="ortho")
+    Fr = torch.fft.rfft2(ref_hp, norm="ortho")
+
+    dot = Fp.real * Fr.real + Fp.imag * Fr.imag
+    denom = torch.abs(Fp) * torch.abs(Fr) + eps
+    phase_sim = dot / denom
+
+    # ref에 실제 high-frequency structure가 있는 부분을 더 신뢰
+    amp_w = torch.abs(Fr).detach()
+    amp_w = amp_w / (amp_w.mean(dim=(-2, -1), keepdim=True) + eps)
+    amp_w = amp_w.clamp(0.1, 5.0)
+
+    loss = ((1.0 - phase_sim) * amp_w).mean()
+    return loss
+
 
 def refine_pd_with_full_anchor(
     teacher_pd,
@@ -548,15 +570,11 @@ class PD_GR2R(L.LightningModule):
             for i in range(MC_STEPS):
                 aug_idx = i % 8
                 y_aug = self.tta_forward(y, aug_idx)
-
-                # Heuristic 기반 (estimator flag 무관, MC sampling은 보조 기능)
-                sigma_map_aug_full, _ = estimate_sigma_structure_aware(y_aug)
-
-                sigma_map_for_aug_sub = pixel_unshuffle(sigma_map_aug_full, 2)
-                sigma_map_aug = F.pad(sigma_map_for_aug_sub, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
-
                 y_sub_aug = pixel_unshuffle(y_aug, 2)
                 y_aug_pad = F.pad(y_sub_aug, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
+
+                # Heuristic 기반 (estimator flag 무관, MC sampling은 보조 기능)
+                sigma_map_aug, _ = estimate_sigma_structure_aware(y_aug_pad)
                 
                 if self.cfg.r2r.use_learned_estimator:
                     aug_variance = sigma_map_aug ** 2
@@ -564,7 +582,6 @@ class PD_GR2R(L.LightningModule):
                     sigma_map_for_aug = torch.exp(0.5 * log_var_aug).detach()
                 else:
                     sigma_map_for_aug = sigma_map_aug.detach()
-
                 
                 root_noise_b = torch.randn_like(y_aug_pad)
                 micro_noise = root_noise_b * (sigma_map_for_aug * 0.1)
@@ -900,14 +917,11 @@ class PD_GR2R(L.LightningModule):
         # ===========================================================
         y_sub = pixel_unshuffle(y, self.cfg.r2r.pd_stride)
         y_sub_pad = F.pad(y_sub, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
-
-        sigma_map_s_full, _ = estimate_sigma_structure_aware(
-            y,
+        sigma_map_s, edge_gate_s = estimate_sigma_structure_aware(
+            y_sub_pad,
             window_size=7,
             edge_gate_min=0.5
         )
-        sigma_map_s_sub = pixel_unshuffle(sigma_map_s_full, self.cfg.r2r.pd_stride)
-        sigma_map_s = F.pad(sigma_map_s_sub, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
         
         if self.cfg.r2r.use_learned_estimator:
             # Learnable estimator 사용
@@ -918,20 +932,15 @@ class PD_GR2R(L.LightningModule):
         else:
             # Heuristic만 사용
             sigma_map_for_est = None
-            sigma_map_for_src = sigma_map_s.detach()
-        
-        # MC boost 적용 (옵션 4)
-        # mc_boost = 1.0 + mc_var_norm_sub_pad * 1.0   # cloud 영역에서 noise 강화
-        mc_boost = 1.0
+            sigma_map_for_src = sigma_map_s.detach()        
         
         root_noise = torch.randn_like(y_sub_pad)
-        heavy_noise = root_noise * (sigma_map_for_src * self.cfg.r2r.sigma_value) * mc_boost
-        target_noise = root_noise * (sigma_map_for_src * 0.5) * mc_boost
+        heavy_noise = root_noise * (sigma_map_for_src * self.cfg.r2r.sigma_value) 
+        target_noise = root_noise * (sigma_map_for_src * 0.5)
         
         y1_sub = (y_sub_pad + heavy_noise).clamp(0, 1)
         y2_sub_pad = (y_sub_pad - target_noise).clamp(0, 1)
         y2_sub = y2_sub_pad[..., pad_size:-pad_size, pad_size:-pad_size]
-        y2_sub_full = pixel_shuffle(y2_sub, self.cfg.r2r.pd_stride)
         
         # Student 예측
         src_residual_pad, src_feat_pad = self.student(y1_sub.clamp(0, 1), return_features='enc')
@@ -941,37 +950,13 @@ class PD_GR2R(L.LightningModule):
         src_pred = src_pred_pad[..., pad_size:-pad_size, pad_size:-pad_size]
         src_pred_full = pixel_shuffle(src_pred, self.cfg.r2r.pd_stride)
 
-        # # source target consistency
-        # full_low = avg_pool_reflect(teacher_full.detach(), 15)
-        
-        # scores = []
-        # for k in range(8):
-        #     pd_low = avg_pool_reflect(mc_preds[k].detach(), 15)
-        #     score = (pd_low - full_low).abs().mean(dim=(1, 2, 3))  # [B]
-        #     scores.append(score)
-        
-        # scores = torch.stack(scores, dim=0)  # [K, B]
-        # best_idx = scores.argmin(dim=0)      # [B]
-
-        # if isinstance(mc_preds, (list, tuple)):
-        #     mc_stack = torch.stack([p.detach() for p in mc_preds], dim=0)  # [K, B, C, H, W]
-        # else:
-        #     mc_stack = mc_preds.detach()  # 이미 [K, B, C, H, W]라고 가정
-        
-        # B = mc_stack.shape[1]
-        # batch_idx = torch.arange(B, device=mc_stack.device)
-        
-        # # best_idx[b]에 해당하는 MC sample을 batch별로 선택
-        # src_label_full = mc_stack[best_idx, batch_idx]  # [B, C, H, W]
-        # src_label_full = src_label_full.detach()
-
-        # loss_src_cons_map = F.smooth_l1_loss(
-        #     src_pred_full,
-        #     src_label_full,
-        #     reduction='none'
-        # )
-        # loss_src_cons = loss_src_cons_map.mean()
-        # w_src_cons = 0.25
+        # phase anchor loss
+        loss_src_phase_anchor = fft_phase_loss(
+            src_pred_full,
+            teacher_full.detach(),
+            hp_kernel=15
+        )
+        w_src_phase_anchor = 0.001
 
         # gram-consistency
         _, _, H_padded, _ = y1_sub.shape
@@ -995,12 +980,12 @@ class PD_GR2R(L.LightningModule):
         
         # Main PD Loss
         src_loss_main = self.r2r_loss(src_pred_full, y2_sub_full)
-        src_loss = src_loss_main + (loss_gram * w_gram) + (loss_phase * w_phase) # + (loss_src_cons * w_src_cons)
+        src_loss = src_loss_main + (loss_gram * w_gram) + (loss_phase * w_phase)  + (loss_src_phase_anchor * w_src_phase_anchor)
         # src_loss = src_loss_main
         self.log('src_loss', src_loss, on_step=True, logger=True)
         self.log('gram_loss',loss_gram*w_gram, on_step=True)
         self.log('phase_loss',loss_phase * w_phase, on_step=True)
-        # self.log('src-cons_loss',loss_src_cons * w_src_cons, on_step=True)
+        self.log('src-phase_loss',loss_src_phase_anchor * w_src_phase_anchor, on_step=True)
         # self.log('debug/mc_boost_mean', mc_boost.mean(), on_step=True)
         # self.log('debug/mc_boost_max', mc_boost.max(), on_step=True)
             
@@ -1208,9 +1193,7 @@ class PD_GR2R(L.LightningModule):
                 y_aug_pad = F.pad(y_sub_aug, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
                 
                 # Heuristic sigma는 항상 계산
-                sigma_map_full, _ = estimate_sigma_structure_aware(y_aug)
-                sigma_map_sub = pixel_unshuffle(sigma_map_full, 2)
-                sigma_map = F.pad(sigma_map_sub, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
+                sigma_map, _ = estimate_sigma_structure_aware(y_aug_pad)
                 
                 # Learnable estimator 분기
                 if self.cfg.r2r.use_learned_estimator:
