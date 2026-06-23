@@ -13,7 +13,7 @@ export CUDA_VISIBLE_DEVICES=1
 # CONFIG_FILE="configs/exp7.yaml"
 # VER="m0.99_ign_src_inter-gram_phase_fda_v2""
 CONFIG_FILE="configs/exp10_lr3e5_sv5.0.yaml"
-VER="exp_ab-full-sigma"
+VER="exp_recall"
 CKPT_ROOT="/hyemin/denoising/ckpts/pcr2r"
 
 # =================================================================

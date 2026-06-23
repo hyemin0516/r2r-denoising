@@ -892,7 +892,8 @@ class PD_GR2R(L.LightningModule):
         res_orig = self.student(y_pad.clamp(0, 1))
         pred_orig_pad = res_orig + y_pad.clamp(0, 1)
         pred_orig = pred_orig_pad[..., pad_size:-pad_size, pad_size:-pad_size]
-        loss_pc = torch.nn.functional.mse_loss(pred_orig, patch_craft_target)
+        # loss_pc = torch.nn.functional.mse_loss(pred_orig, patch_craft_target)
+        loss_pc = self.r2r_loss(pred_orig, patch_craft_target)
         # loss_mask = (confidence > 0.5).float()
         # loss_pc = (((pred_orig - patch_craft_target) ** 2) * loss_mask).sum() / (loss_mask.sum() + 1e-8)
 
@@ -902,7 +903,7 @@ class PD_GR2R(L.LightningModule):
         second_pass_pred = second_pass_residual + pred_detached
 
         loss_idem = F.mse_loss(second_pass_pred, pred_detached, reduction='none')
-        w_idem = (1-confidence).detach().clamp(min=0.1)
+        w_idem = (1-confidence).detach().clamp(min=0.1) # * 3.0
         
         trg_loss = loss_pc + (loss_idem * w_idem).mean()
         # trg_loss = loss_pc
@@ -951,12 +952,12 @@ class PD_GR2R(L.LightningModule):
         src_pred_full = pixel_shuffle(src_pred, self.cfg.r2r.pd_stride)
 
         # phase anchor loss
-        loss_src_phase_anchor = fft_phase_loss(
-            src_pred_full,
-            teacher_full.detach(),
-            hp_kernel=15
-        )
-        w_src_phase_anchor = 0.001
+        # loss_src_phase_anchor = fft_phase_loss(
+        #     src_pred_full,
+        #     teacher_full.detach(),
+        #     hp_kernel=15
+        # )
+        # w_src_phase_anchor = 0.001
 
         # gram-consistency
         _, _, H_padded, _ = y1_sub.shape
@@ -969,7 +970,7 @@ class PD_GR2R(L.LightningModule):
         G_src_grouped = G_src_batch.reshape(b_original, stride * stride, c_gram, c_gram)
         G_center = G_src_grouped.mean(dim=1, keepdim=True)
         loss_gram = torch.nn.functional.l1_loss(G_src_grouped, G_center.expand_as(G_src_grouped))
-        w_gram = 1e5
+        w_gram = self.cfg.solver.w_gram
 
         # phase consistency
         loss_phase = pd_subpatch_phase_mean_loss(
@@ -979,13 +980,13 @@ class PD_GR2R(L.LightningModule):
         w_phase = self.cfg.solver.w_phase
         
         # Main PD Loss
-        src_loss_main = self.r2r_loss(src_pred_full, y2_sub_full)
-        src_loss = src_loss_main + (loss_gram * w_gram) + (loss_phase * w_phase)  + (loss_src_phase_anchor * w_src_phase_anchor)
+        src_loss_main = self.r2r_loss(src_pred, y2_sub)
+        src_loss = src_loss_main + (loss_gram * w_gram) + (loss_phase * w_phase) # + (loss_src_phase_anchor * w_src_phase_anchor)
         # src_loss = src_loss_main
         self.log('src_loss', src_loss, on_step=True, logger=True)
         self.log('gram_loss',loss_gram*w_gram, on_step=True)
         self.log('phase_loss',loss_phase * w_phase, on_step=True)
-        self.log('src-phase_loss',loss_src_phase_anchor * w_src_phase_anchor, on_step=True)
+        # self.log('src-phase_loss',loss_src_phase_anchor * w_src_phase_anchor, on_step=True)
         # self.log('debug/mc_boost_mean', mc_boost.mean(), on_step=True)
         # self.log('debug/mc_boost_max', mc_boost.max(), on_step=True)
             
