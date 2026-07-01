@@ -20,6 +20,7 @@ r2r:
   noise_level: 0.05      # 초기 노이즈 레벨 (dist 관련)
   edge_sensitivity: 2.0
   use_learned_estimator: False
+  use_eff_noise_dist: true
   
   # Sigma Map 추정 관련
   sigma_mode: "fixed"    # fixed | estimated
@@ -51,6 +52,7 @@ solver:
   lr: 1e-4    # LR
   loss_type: "mse"
   wd: 1e-8
+  lr_effdist: 1e-5
   max_steps: 50000
   lr_steps: [30000, 40000] # [1000, 3000, 5000] # [8000, 15000] 
   warmup_steps: 2000      # [추가] 전체 300 epoch 중 5% 구간 웜업

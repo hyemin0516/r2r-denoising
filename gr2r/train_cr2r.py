@@ -10,6 +10,7 @@ from omegaconf import OmegaConf
 import numpy as np
 import matplotlib.pyplot as plt
 import math
+import random
 import wandb
 
 import torch
@@ -193,65 +194,93 @@ def pd_subpatch_phase_mean_loss(residual, stride=4):
 
     return (phase_mean - mean_center).abs().mean()
 
-class ConfidencePCViewAmpGenerator(nn.Module):
+def normalize_map_q95(x, eps=1e-8):
+    """
+    x: [B, 1, H, W]
+    """
+    q95 = x.flatten(2).quantile(0.95, dim=2)[..., None, None]
+    return (x / (q95 + eps)).clamp(0, 1)
+
+
+def normalize_direction(d, eps=1e-8):
+    """
+    d: [B, C, H, W]
+    각 residual direction의 global spatial scale을 1로 맞춤.
+    이후 estimator가 예측한 sigma가 실제 PC-view residual scale 역할을 함.
+    """
+    d = d.detach()
+    d_std = d.std(dim=(2, 3), keepdim=True) + eps
+    return d / d_std
+
+class EffectiveNoiseDistributionEstimator(nn.Module):
     def __init__(
         self,
-        num_sources=10,
+        num_pairs=5,
         hidden=32,
-        min_amp=0.005,
-        max_amp=0.15,
-        smooth_kernel=9,
+        min_sigma=0.0005,
+        max_sigma=0.0400,
+        init_sigma=0.0100,
+        smooth_kernel=7,
     ):
         super().__init__()
 
-        self.num_sources = num_sources
-        self.min_amp = min_amp
-        self.max_amp = max_amp
+        self.num_pairs = num_pairs
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
         self.smooth_kernel = smooth_kernel
 
-        # inputs:
-        # conf_smooth    : 1ch
-        # mc_std_norm    : 1ch
-        # base_amp       : num_sources ch
-        in_ch = 2 + num_sources
+        self.conv1 = nn.Conv2d(4, hidden, 3, padding=1)
+        self.conv2 = nn.Conv2d(hidden, hidden, 3, padding=1)
+        self.conv_out = nn.Conv2d(hidden, num_pairs * 2, 3, padding=1)
 
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, hidden, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(hidden, num_sources, 3, padding=1),
-        )
+        self.act = nn.GELU()
 
-    def forward(self, conf_smooth, mc_std_norm, base_amp):
+        # 안정적인 초기 sigma로 시작
+        init_ratio = (init_sigma - min_sigma) / (max_sigma - min_sigma)
+        init_ratio = min(max(init_ratio, 1e-4), 1.0 - 1e-4)
+        init_bias = math.log(init_ratio / (1.0 - init_ratio))
+
+        nn.init.zeros_(self.conv_out.weight)
+        nn.init.constant_(self.conv_out.bias, init_bias)
+
+    def forward(self, conf_smooth, mc_std_norm, d_pf_norm, r_full_norm):
         """
-        conf_smooth : [B, 1, H, W]
-        mc_std_norm : [B, 1, H, W]
-        base_amp    : [B, 10, H, W]
+        inputs:
+            conf_smooth : [B, 1, H, W]
+            mc_std_norm : [B, 1, H, W]
+            d_pf_norm   : [B, 1, H, W]
+            r_full_norm : [B, 1, H, W]
 
-        return:
-            pc_amp  : [B, 10, H, W]
+        returns:
+            sigma_pos   : [B, num_pairs, H, W]
+            sigma_neg   : [B, num_pairs, H, W]
         """
 
         x = torch.cat(
             [
                 conf_smooth.detach(),
                 mc_std_norm.detach(),
-                base_amp.detach(),
+                d_pf_norm.detach(),
+                r_full_norm.detach(),
             ],
             dim=1,
         )
 
-        raw = self.net(x)
+        h = self.act(self.conv1(x))
+        h = self.act(self.conv2(h))
+        raw = self.conv_out(h)
 
-        pc_amp = self.min_amp + (
-            self.max_amp - self.min_amp
+        sigma = self.min_sigma + (
+            self.max_sigma - self.min_sigma
         ) * torch.sigmoid(raw)
 
         if self.smooth_kernel is not None and self.smooth_kernel > 1:
-            pc_amp = avg_pool_reflect(pc_amp, self.smooth_kernel)
+            sigma = avg_pool_reflect(sigma, self.smooth_kernel)
 
-        return pc_amp
+        sigma_pos = sigma[:, 0::2]
+        sigma_neg = sigma[:, 1::2]
+
+        return sigma_pos, sigma_neg
 
 
 class PD_GR2R(L.LightningModule):
@@ -275,12 +304,13 @@ class PD_GR2R(L.LightningModule):
         self.ssim_teacher = StructuralSimilarityIndexMeasure(data_range=1.0)
         self.ssim_teacher_src = StructuralSimilarityIndexMeasure(data_range=1.0)
 
-        self.pc_amp_generator = ConfidencePCViewAmpGenerator(
-            num_sources=10,
+        self.noise_dist_estimator = EffectiveNoiseDistributionEstimator(
+            num_pairs=5,
             hidden=32,
-            min_amp=0.005,
-            max_amp=0.15,
-            smooth_kernel=9,
+            min_sigma=0.0005,
+            max_sigma=0.0400,
+            init_sigma=0.0100,
+            smooth_kernel=7,
         )
 
         self.automatic_optimization = False
@@ -303,56 +333,66 @@ class PD_GR2R(L.LightningModule):
         # return teacher, student
 
     def configure_optimizers(self):
+        # ============================================================
+        # 1. Parameter groups
+        # ============================================================
         main_params = [p for n, p in self.student.named_parameters()]
-        
+    
+        param_groups = [
+            {
+                "params": main_params,
+                "lr": self.cfg.solver.lr,
+            }
+        ]
+    
+        # 기존 learned sigma estimator
         if self.cfg.r2r.use_learned_estimator:
-            estimator_params = [p for n, p in self.noise_estimator.named_parameters()]
-            optimizer = torch.optim.Adam([
-                {'params': main_params, 'lr': self.cfg.solver.lr},
-                {'params': estimator_params, 'lr': 1e-6}
-            ], weight_decay=self.cfg.solver.wd)
-        else:
-            optimizer = torch.optim.Adam(
-                main_params, lr=self.cfg.solver.lr, weight_decay=self.cfg.solver.wd
+            noise_estimator_params = [
+                p for n, p in self.noise_estimator.named_parameters()
+            ]
+    
+            param_groups.append(
+                {
+                    "params": noise_estimator_params,
+                    "lr": self.cfg.solver.lr_noise_estimator,
+                }
             )
-        # optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.solver.lr, weight_decay=self.cfg.solver.wd)
-
-        # total_steps = self.cfg.solver.max_steps
-        # warmup_steps = self.cfg.solver.warmup_steps
-
-        # warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        #     optimizer, start_factor=0.01, total_iters=warmup_steps
-        # )
-
-        # cosine_steps = total_steps - warmup_steps
+    
+        # 새 post-ISP effective noise distribution estimator
+        if self.cfg.r2r.use_eff_noise_dist:
+            noise_dist_params = [
+                p for n, p in self.noise_dist_estimator.named_parameters()
+            ]
+    
+            param_groups.append(
+                {
+                    "params": noise_dist_params,
+                    "lr": self.cfg.solver.lr_effdist,
+                }
+            )
+    
+        optimizer = torch.optim.Adam(
+            param_groups,
+            weight_decay=self.cfg.solver.wd,
+        )
+    
+        # ============================================================
+        # 2. Scheduler
+        # ============================================================
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.cfg.solver.max_steps,  # 예: 100
-            eta_min=self.cfg.solver.min_lr  # 최소 LR (0이 되지 않게 안전장치)
+            T_max=self.cfg.solver.max_steps,
+            eta_min=self.cfg.solver.min_lr,
         )
-
-        # scheduler = torch.optim.lr_scheduler.SequentialLR(
-        #     optimizer, 
-        #     schedulers=[warmup_scheduler, cosine_scheduler], 
-        #     milestones=[warmup_steps]
-        # )
-        
-        # scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        #         optimizer,
-        #         milestones=self.cfg.solver.lr_steps,  
-        #         gamma=0.5                        
-        # )  
-
-
+    
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "step",  # ★ 매우 중요: 'epoch'이 아니라 'step'마다 갱신!
+                "interval": "step",
                 "frequency": 1,
-                # "monitor": "val_psnr", # (선택사항) ReduceLROnPlateau 쓸 때만 필요
                 "strict": True,
-            }
+            },
         }
 
 
@@ -641,278 +681,448 @@ class PD_GR2R(L.LightningModule):
         # ===========================================================
         # 2. Target loss (Patch-Craft based)
         # ===========================================================
+        # 실험 고정값
+        patch_size = 16
+        half = patch_size // 2
+        pad = half
+        
+        beta_pf = 0.25
+        beta_res = 0.10
+        
+        w_eff_var = 0.02
+        w_eff_mean = 0.001
+        w_sigma_tv = 0.001
+        
         with torch.no_grad():
             B, C, H, W = y.shape
-            patch_size = 16
-            half = patch_size // 2
-            pad = half  # 8
-            
-            # teacher_pd
-            teacher_pd = pred_mc_clean
-            base_idx = torch.randint(0, len(mc_preds), (1,)).item()
-            base_pd = mc_preds[base_idx].detach()
-
-            
-            # confidence map smoothing
-            y_pad = F.pad(y, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
-            teacher_full_residual, trg_feat_pad = self.teacher(y_pad.clamp(0, 1), return_features='enc')
-            teacher_full_pad = teacher_full_residual + y_pad.clamp(0, 1)
-            teacher_full = teacher_full_pad[..., pad_size:-pad_size, pad_size:-pad_size]
-
-            #teacher gram
-            conf_map = confidence.mean(dim=1, keepdim=True).detach()
-
-            conf_smooth = F.avg_pool2d(
-                conf_map,
-                kernel_size=patch_size,
-                stride=1,
-                padding=patch_size // 2
-            )
-            conf_smooth = conf_smooth[..., :H, :W]
-
-            mc_stack = torch.stack([p.detach() for p in mc_preds], dim=0)
-            mc_std = mc_stack.std(dim=0).mean(dim=1, keepdim=True)
         
-            mc_q95 = mc_std.flatten(2).quantile(0.95, dim=2)[..., None, None]
-            mc_std_norm = (mc_std / (mc_q95 + 1e-8)).clamp(0, 1)
-
-            # n_hat residual
-            n_hat_full = y - teacher_full
-            n_hat_pd = y - teacher_pd
-
-            # Batch shuffle indices (각 source마다 다른 permutation)
+            # -------------------------------------------------------
+            # 2-1. Teacher outputs
+            # -------------------------------------------------------
+            teacher_pd = pred_mc_clean.detach()
+        
+            base_idx = random.randrange(len(mc_preds))
+            base_pd = mc_preds[base_idx].detach()
+        
+            y_pad = F.pad(
+                y,
+                (pad_size, pad_size, pad_size, pad_size),
+                mode="reflect",
+            )
+        
+            teacher_full_residual, trg_feat_pad = self.teacher(
+                y_pad.clamp(0, 1),
+                return_features="enc",
+            )
+            teacher_full_pad = teacher_full_residual + y_pad.clamp(0, 1)
+            teacher_full = teacher_full_pad[
+                ...,
+                pad_size:-pad_size,
+                pad_size:-pad_size,
+            ].detach()
+        
+            # -------------------------------------------------------
+            # 2-2. Confidence / MC statistics
+            # -------------------------------------------------------
+            conf_map = confidence.mean(dim=1, keepdim=True).detach()
+        
+            # 기존 even-kernel avg_pool 대신 reflect smoothing 사용
+            conf_smooth = avg_pool_reflect(conf_map, kernel_size=15)
+            conf_smooth = conf_smooth.clamp(0, 1)
+        
+            mc_stack = torch.stack([p.detach() for p in mc_preds], dim=0)  # [K,B,C,H,W]
+        
+            mc_mean = mc_stack.mean(dim=0)
+            mc_var = mc_stack.var(dim=0, unbiased=False).mean(dim=1, keepdim=True)
+            mc_std = torch.sqrt(mc_var + 1e-8)
+            mc_std_norm = normalize_map_q95(mc_std)
+        
+            # -------------------------------------------------------
+            # 2-3. Teacher discrepancy / residual cues
+            # -------------------------------------------------------
+            d_pf = (teacher_pd - teacher_full).detach()
+            d_pf_map = d_pf.abs().mean(dim=1, keepdim=True)
+            d_pf_map = avg_pool_reflect(d_pf_map, kernel_size=7)
+            d_pf_norm = normalize_map_q95(d_pf_map)
+        
+            r_full = (y - teacher_full).detach()
+            r_full_map = r_full.abs().mean(dim=1, keepdim=True)
+            r_full_map = avg_pool_reflect(r_full_map, kernel_size=7)
+            r_full_norm = normalize_map_q95(r_full_map)
+        
+            # variance target for distribution consistency
+            d_pf_var = avg_pool_reflect(
+                d_pf.pow(2).mean(dim=1, keepdim=True),
+                kernel_size=7,
+            )
+        
+            r_full_var = avg_pool_reflect(
+                r_full.pow(2).mean(dim=1, keepdim=True),
+                kernel_size=7,
+            )
+        
+            var_target = (
+                mc_var
+                + beta_pf * d_pf_var
+                + beta_res * r_full_var
+            ).detach().clamp_min(1e-8)
+        
+            # -------------------------------------------------------
+            # 2-4. Residual templates
+            # -------------------------------------------------------
+            n_hat_full = (y - teacher_full).detach()
+            n_hat_pd = (y - teacher_pd).detach()
+        
             perm1 = torch.randperm(B, device=y.device)
             perm2 = torch.randperm(B, device=y.device)
             perm3 = torch.randperm(B, device=y.device)
             perm4 = torch.randperm(B, device=y.device)
-
-            # Cross-batch noise
+        
             n_hat_full_cross1 = n_hat_full[perm1]
             n_hat_full_cross2 = n_hat_full[perm2]
             n_hat_pd_cross1 = n_hat_pd[perm3]
             n_hat_pd_cross2 = n_hat_pd[perm4]
-
-            base_amp = (
-                (0.15 - 0.05)
-                * torch.rand(B, 10, 1, 1, device=y.device)
-                + 0.05
-            )
-            base_amp = base_amp.expand(-1, -1, H, W)
         
-            # old reference only for regularization
-            min_gate = 0.3
-            old_noise_gate = min_gate + (1.0 - min_gate) * conf_smooth
-            amp_ref = base_amp * old_noise_gate
-
-        pc_amp = self.pc_amp_generator(
+        # -----------------------------------------------------------
+        # 2-5. Effective noise distribution estimation
+        #     여기부터는 no_grad 밖이어야 함.
+        # -----------------------------------------------------------
+        sigma_pos, sigma_neg = self.noise_dist_estimator(
             conf_smooth=conf_smooth,
             mc_std_norm=mc_std_norm,
-            base_amp=base_amp,
+            d_pf_norm=d_pf_norm,
+            r_full_norm=r_full_norm,
         )
         
-        sigma_1 = pc_amp[:, 0:1]
-        sigma_2 = pc_amp[:, 1:2]
-        sigma_3 = pc_amp[:, 2:3]
-        sigma_4 = pc_amp[:, 3:4]
-        sigma_5 = pc_amp[:, 4:5]
-        sigma_6 = pc_amp[:, 5:6]
-        sigma_7 = pc_amp[:, 6:7]
-        sigma_8 = pc_amp[:, 7:8]
-        sigma_9 = pc_amp[:, 8:9]
-        sigma_10 = pc_amp[:, 9:10]
-            
-        # Type 1: n_hat residual based
-        source_pos1 = teacher_full + sigma_1 * n_hat_full_cross1
-        source_neg1 = teacher_full - sigma_2 * n_hat_full_cross2
+        # -----------------------------------------------------------
+        # 2-6. MC deviation based stochastic directions
+        # -----------------------------------------------------------
+        mc_idx_1 = random.randrange(1, len(mc_preds))
+        mc_idx_2 = random.randrange(1, len(mc_preds))
+        mc_idx_3 = random.randrange(1, len(mc_preds))
+        mc_idx_4 = random.randrange(1, len(mc_preds))
         
-        # Type 2: Variance-preserving stochastic noise mixing
-        # 8개의 MC 샘플 중 무작위로 2개의 뷰 선택
-        mc_idx_1 = torch.randint(1, len(mc_preds), (1,)).item()
-        mc_idx_2 = torch.randint(1, len(mc_preds), (1,)).item()
-        mc_idx_3 = torch.randint(1, len(mc_preds), (1,)).item()
-        mc_idx_4 = torch.randint(1, len(mc_preds), (1,)).item()
+        mc_dev_1 = mc_preds[mc_idx_1].detach() - pred_mc_clean.detach()
+        mc_dev_2 = mc_preds[mc_idx_2].detach() - pred_mc_clean.detach()
+        mc_dev_3 = mc_preds[mc_idx_3].detach() - pred_mc_clean.detach()
+        mc_dev_4 = mc_preds[mc_idx_4].detach() - pred_mc_clean.detach()
         
-        # 순수 인식적 편차 추출 (Zero-mean deviation)
-        mc_dev_1 = mc_preds[mc_idx_1].detach() - pred_mc_clean
-        mc_dev_2 = mc_preds[mc_idx_2].detach() - pred_mc_clean
-        mc_dev_3 = mc_preds[mc_idx_3].detach() - pred_mc_clean
-        mc_dev_4 = mc_preds[mc_idx_4].detach() - pred_mc_clean
+        shift_y1 = random.randint(-3, 3)
+        shift_x1 = random.randint(-3, 3)
+        shift_y2 = random.randint(-3, 3)
+        shift_x2 = random.randint(-3, 3)
+        shift_y3 = random.randint(-3, 3)
+        shift_x3 = random.randint(-3, 3)
+        shift_y4 = random.randint(-3, 3)
+        shift_x4 = random.randint(-3, 3)
         
-        # 2. Phase-Shifted Decorrelation (격자 파괴 로직)
-        # -3 ~ +3 픽셀 단위의 Random Roll을 통해 PD의 고주파 주기성(Grid)을 완벽히 파괴
-        shift_x1, shift_y1 = torch.randint(-3, 4, (2,)).tolist()
-        shift_x2, shift_y2 = torch.randint(-3, 4, (2,)).tolist()
-        shift_x3, shift_y3 = torch.randint(-3, 4, (2,)).tolist()
-        shift_x4, shift_y4 = torch.randint(-3, 4, (2,)).tolist()
+        mc_dev_1 = torch.roll(mc_dev_1, shifts=(shift_y1, shift_x1), dims=(2, 3))
+        mc_dev_2 = torch.roll(mc_dev_2, shifts=(shift_y2, shift_x2), dims=(2, 3))
+        mc_dev_3 = torch.roll(mc_dev_3, shifts=(shift_y3, shift_x3), dims=(2, 3))
+        mc_dev_4 = torch.roll(mc_dev_4, shifts=(shift_y4, shift_x4), dims=(2, 3))
         
-        mc_dev_1_jittered = torch.roll(mc_dev_1, shifts=(shift_y1, shift_x1), dims=(2, 3))
-        mc_dev_2_jittered = torch.roll(mc_dev_2, shifts=(shift_y2, shift_x2), dims=(2, 3))
-        mc_dev_3_jittered = torch.roll(mc_dev_3, shifts=(shift_y3, shift_x3), dims=(2, 3))
-        mc_dev_4_jittered = torch.roll(mc_dev_4, shifts=(shift_y4, shift_x4), dims=(2, 3))
-        
-        # 3. Variance Matching (스케일 동기화)
         n_hat_std = n_hat_pd.std(dim=(2, 3), keepdim=True) + 1e-8
-        mc_dev_std_1 = mc_dev_1_jittered.std(dim=(2, 3), keepdim=True) + 1e-8
-        mc_dev_std_2 = mc_dev_2_jittered.std(dim=(2, 3), keepdim=True) + 1e-8
-        mc_dev_std_3 = mc_dev_3_jittered.std(dim=(2, 3), keepdim=True) + 1e-8
-        mc_dev_std_4 = mc_dev_4_jittered.std(dim=(2, 3), keepdim=True) + 1e-8
         
-        n_new_1 = (mc_dev_1_jittered / mc_dev_std_1) * n_hat_std
-        n_new_2 = (mc_dev_2_jittered / mc_dev_std_2) * n_hat_std
-        n_new_3 = (mc_dev_3_jittered / mc_dev_std_3) * n_hat_std
-        n_new_4 = (mc_dev_4_jittered / mc_dev_std_4) * n_hat_std
+        mc_dev_std_1 = mc_dev_1.std(dim=(2, 3), keepdim=True) + 1e-8
+        mc_dev_std_2 = mc_dev_2.std(dim=(2, 3), keepdim=True) + 1e-8
+        mc_dev_std_3 = mc_dev_3.std(dim=(2, 3), keepdim=True) + 1e-8
+        mc_dev_std_4 = mc_dev_4.std(dim=(2, 3), keepdim=True) + 1e-8
         
-        # 4. Variance-preserving Spherical Interpolation
-        alpha = confidence.clamp(min=0.3, max=1.0)
-        beta = torch.sqrt((1.0 - alpha**2).clamp(min=0))
+        n_new_1 = (mc_dev_1 / mc_dev_std_1) * n_hat_std
+        n_new_2 = (mc_dev_2 / mc_dev_std_2) * n_hat_std
+        n_new_3 = (mc_dev_3 / mc_dev_std_3) * n_hat_std
+        n_new_4 = (mc_dev_4 / mc_dev_std_4) * n_hat_std
+        
+        alpha = confidence.detach().clamp(min=0.3, max=1.0)
+        beta = torch.sqrt((1.0 - alpha ** 2).clamp(min=0.0))
         
         n_mixed_1 = alpha * n_hat_pd + beta * n_new_1
         n_mixed_2 = alpha * n_hat_pd + beta * n_new_2
         n_mixed_3 = alpha * n_hat_pd + beta * n_new_3
         n_mixed_4 = alpha * n_hat_pd + beta * n_new_4
         
-        # 5. 타겟 생성 (Blur 없는 teacher_full을 베이스로 사용)
-        source_pos2 = base_pd + sigma_3 * n_mixed_1
-        source_neg2 = base_pd - sigma_4 * n_mixed_2
-        source_pos3 = base_pd + sigma_5 * n_mixed_3
-        source_neg3 = base_pd - sigma_6 * n_mixed_4
-
-        # type 3: Zero-Artifact Extrapolation + frequency-mixed artifact direction
-        artifact_delta = teacher_pd - teacher_full
-        
-        delta_std = artifact_delta.std(dim=(2, 3), keepdim=True) + 1e-8
-        artifact_delta_unit = artifact_delta / delta_std
-        
-        
+        artifact_delta = (teacher_pd - teacher_full).detach()
+        artifact_delta_std = artifact_delta.std(dim=(2, 3), keepdim=True) + 1e-8
+        artifact_delta_unit = artifact_delta / artifact_delta_std
         artifact_delta_matched = artifact_delta_unit * n_hat_std
         
-        source_pos4 = teacher_full + sigma_7 * artifact_delta_matched
-        source_neg4 = teacher_full - sigma_8 * artifact_delta_matched
-
-        # Type 4: n_hat_pd residual based
-        source_pos5 = teacher_pd + sigma_9 * n_hat_pd_cross1
-        source_neg5 = teacher_pd - sigma_10 * n_hat_pd_cross2
+        # -----------------------------------------------------------
+        # 2-7. Normalize residual directions
+        # -----------------------------------------------------------
+        d1_pos = normalize_direction(n_hat_full_cross1)
+        d1_neg = normalize_direction(n_hat_full_cross2)
         
-        # Sources list (6 sources)
-        sources = [
-            source_pos1,     # 0: n_hat_full +
-            source_neg1,     # 1: n_hat_full -
-            source_pos2,     # 2: n_hat_pd +
-            source_neg2,     # 3: n_hat_pd -
-            source_pos3,     # 4: n_hat_pd +
-            source_neg3,     # 5: n_hat_pd -
-            source_pos4,     # 6: extrapolated_anchor +
-            source_neg4,     # 7: extrapolated_anchor -
-            source_pos5,
-            source_neg5,
-            
+        d2_pos = normalize_direction(n_mixed_1)
+        d2_neg = normalize_direction(n_mixed_2)
+        
+        d3_pos = normalize_direction(n_mixed_3)
+        d3_neg = normalize_direction(n_mixed_4)
+        
+        d4_pos = normalize_direction(artifact_delta_matched)
+        d4_neg = normalize_direction(artifact_delta_matched)
+        
+        d5_pos = normalize_direction(n_hat_pd_cross1)
+        d5_neg = normalize_direction(n_hat_pd_cross2)
+        
+        # -----------------------------------------------------------
+        # 2-8. Sample PC-view sources from estimated distribution
+        #      raw source는 consistency loss용,
+        #      clamp source는 Patch-Craft target용.
+        # -----------------------------------------------------------
+        source_pos1_raw = teacher_full + sigma_pos[:, 0:1] * d1_pos
+        source_neg1_raw = teacher_full - sigma_neg[:, 0:1] * d1_neg
+        
+        source_pos2_raw = base_pd + sigma_pos[:, 1:2] * d2_pos
+        source_neg2_raw = base_pd - sigma_neg[:, 1:2] * d2_neg
+        
+        source_pos3_raw = base_pd + sigma_pos[:, 2:3] * d3_pos
+        source_neg3_raw = base_pd - sigma_neg[:, 2:3] * d3_neg
+        
+        source_pos4_raw = teacher_full + sigma_pos[:, 3:4] * d4_pos
+        source_neg4_raw = teacher_full - sigma_neg[:, 3:4] * d4_neg
+        
+        source_pos5_raw = teacher_pd + sigma_pos[:, 4:5] * d5_pos
+        source_neg5_raw = teacher_pd - sigma_neg[:, 4:5] * d5_neg
+        
+        sources_raw = [
+            source_pos1_raw,
+            source_neg1_raw,
+            source_pos2_raw,
+            source_neg2_raw,
+            source_pos3_raw,
+            source_neg3_raw,
+            source_pos4_raw,
+            source_neg4_raw,
+            source_pos5_raw,
+            source_neg5_raw,
         ]
-            
-        # ====== Padding 추가 ======
-        # 모든 sources와 mask를 mirror padding
-        sources_padded = [F.pad(s, (pad, pad, pad, pad), mode='reflect') for s in sources]
-        teacher_pd_padded = F.pad(teacher_pd, (pad, pad, pad, pad), mode='reflect')
-        conf_smooth_padded = F.pad(conf_smooth, (pad, pad, pad, pad), mode='reflect')
+        
+        sources = [s.clamp(0, 1) for s in sources_raw]
+        
+        # -----------------------------------------------------------
+        # 2-9. Distribution consistency loss
+        # -----------------------------------------------------------
+        anchors = [
+            teacher_full,
+            teacher_full,
+            base_pd,
+            base_pd,
+            base_pd,
+            base_pd,
+            teacher_full,
+            teacher_full,
+            teacher_pd,
+            teacher_pd,
+        ]
+        
+        pc_residuals = [
+            src_raw - anc.detach()
+            for src_raw, anc in zip(sources_raw, anchors)
+        ]
+        
+        res_stack = torch.stack(pc_residuals, dim=0)  # [10, B, C, H, W]
+        
+        gen_var = res_stack.var(dim=0, unbiased=False)
+        gen_var = gen_var.mean(dim=1, keepdim=True).clamp_min(1e-8)
+        
+        gen_res_mean = res_stack.mean(dim=0)
+        
+        loss_eff_var = F.smooth_l1_loss(
+            torch.log(gen_var + 1e-8),
+            torch.log(var_target + 1e-8),
+        )
+        
+        loss_eff_mean = gen_res_mean.abs().mean()
+        
+        loss_sigma_tv = (
+            (sigma_pos[..., 1:, :] - sigma_pos[..., :-1, :]).abs().mean()
+            + (sigma_pos[..., :, 1:] - sigma_pos[..., :, :-1]).abs().mean()
+            + (sigma_neg[..., 1:, :] - sigma_neg[..., :-1, :]).abs().mean()
+            + (sigma_neg[..., :, 1:] - sigma_neg[..., :, :-1]).abs().mean()
+        )
+        
+        # -----------------------------------------------------------
+        # 2-10. Patch-Craft routing & composition
+        # -----------------------------------------------------------
+        sources_padded = [
+            F.pad(s, (pad, pad, pad, pad), mode="reflect")
+            for s in sources
+        ]
+        
+        teacher_pd_padded = F.pad(
+            teacher_pd,
+            (pad, pad, pad, pad),
+            mode="reflect",
+        )
         
         H_pad = H + 2 * pad
         W_pad = W + 2 * pad
         
-        # Grid 크기 (padded 기준)
         n_grid_h = H_pad // patch_size
         n_grid_w = W_pad // patch_size
         
-        # Random offset (padded image 안에서)
-        offset_h = torch.randint(0, patch_size, (1,)).item()
-        offset_w = torch.randint(0, patch_size, (1,)).item()
+        offset_h = random.randint(0, patch_size - 1)
+        offset_w = random.randint(0, patch_size - 1)
         
-        # Padded matched_target
-        # matched_target_padded = teacher_pd_padded.clone()
-
         matched_target_padded = teacher_pd_padded.clone()
-        selection_mask_padded = torch.zeros(B, 1, H_pad, W_pad, device=y.device)
+        selection_mask_padded = torch.zeros(
+            B,
+            1,
+            H_pad,
+            W_pad,
+            device=y.device,
+            dtype=y.dtype,
+        )
+        
+        # GPU sync 줄이기 위해 source index를 CPU에서 미리 샘플링
+        src_idx_grid = torch.randint(
+            low=0,
+            high=len(sources_padded),
+            size=(B, n_grid_h, n_grid_w),
+            device=torch.device("cpu"),
+        )
         
         for b in range(B):
             for gi in range(n_grid_h):
                 for gj in range(n_grid_w):
                     cy_val = offset_h + gi * patch_size + half
                     cx_val = offset_w + gj * patch_size + half
+        
                     cy_val = min(cy_val, H_pad - 1)
                     cx_val = min(cx_val, W_pad - 1)
-                    
-                    # Clean check (padded mask)
-                    # if hard_conf_mask_padded[b, 0, cy_val, cx_val] < 0.5:
-                    #     continue
-                    
-                    src_idx = torch.randint(0, len(sources_padded), (1,)).item()
-                    source = sources_padded[src_idx]
-                    
+        
                     cy_s = max(0, cy_val - half)
                     cy_e = min(H_pad, cy_val + half)
                     cx_s = max(0, cx_val - half)
                     cx_e = min(W_pad, cx_val + half)
-                    
-                    matched_target_padded[b, :, cy_s:cy_e, cx_s:cx_e] = \
-                        source[b, :, cy_s:cy_e, cx_s:cx_e]
-                    selection_mask_padded[b, 0, cy_s:cy_e, cx_s:cx_e] = 1
         
-        # Crop back to original size
-        matched_target = matched_target_padded[:, :, pad:pad+H, pad:pad+W]
-        selection_mask = selection_mask_padded[:, :, pad:pad+H, pad:pad+W]
+                    src_idx = int(src_idx_grid[b, gi, gj])
+                    source = sources_padded[src_idx]
         
+                    matched_target_padded[
+                        b,
+                        :,
+                        cy_s:cy_e,
+                        cx_s:cx_e,
+                    ] = source[
+                        b,
+                        :,
+                        cy_s:cy_e,
+                        cx_s:cx_e,
+                    ]
+        
+                    selection_mask_padded[
+                        b,
+                        0,
+                        cy_s:cy_e,
+                        cx_s:cx_e,
+                    ] = 1.0
+        
+        matched_target = matched_target_padded[
+            :,
+            :,
+            pad:pad + H,
+            pad:pad + W,
+        ]
+        
+        selection_mask = selection_mask_padded[
+            :,
+            :,
+            pad:pad + H,
+            pad:pad + W,
+        ]
+        
+        # target은 detach 유지.
+        # estimator는 loss_eff_var / loss_eff_mean / loss_sigma_tv로 학습.
         patch_craft_target = matched_target.detach()
-                
         
-        # Loss
-        # with torch.no_grad():
-        #     sigma_map, _ = estimate_sigma_structure_aware(y)
-        #     sv_input_trg = self.cfg.r2r.sv_input_trg
-
-        #     confidence_factor = 1.0 + (1.0 - confidence.clamp(min=conf_threshold))
-        #     root_noise_trg = torch.randn_like(y)
-        #     y_input_trg = (y + root_noise_trg * sigma_map * sv_input_trg * confidence_factor).clamp(0, 1)
-
-        y_pad = F.pad(y, (pad_size, pad_size, pad_size, pad_size), mode='reflect')
+        # -----------------------------------------------------------
+        # 2-11. Target branch student loss
+        # -----------------------------------------------------------
+        y_pad = F.pad(
+            y,
+            (pad_size, pad_size, pad_size, pad_size),
+            mode="reflect",
+        )
+        
         res_orig = self.student(y_pad.clamp(0, 1))
         pred_orig_pad = res_orig + y_pad.clamp(0, 1)
-        pred_orig = pred_orig_pad[..., pad_size:-pad_size, pad_size:-pad_size]
-        # loss_pc = torch.nn.functional.mse_loss(pred_orig, patch_craft_target)
+        pred_orig = pred_orig_pad[
+            ...,
+            pad_size:-pad_size,
+            pad_size:-pad_size,
+        ]
+        
         loss_pc = self.r2r_loss(pred_orig, patch_craft_target)
-        # loss_mask = (confidence > 0.5).float()
-        # loss_pc = (((pred_orig - patch_craft_target) ** 2) * loss_mask).sum() / (loss_mask.sum() + 1e-8)
-
+        
         pred_detached = teacher_full.detach()
-
+        
         second_pass_residual = self.student(pred_detached)
         second_pass_pred = second_pass_residual + pred_detached
-
-        loss_idem = F.mse_loss(second_pass_pred, pred_detached, reduction='none')
-        w_idem = (1-confidence).detach().clamp(min=0.1) # * 3.0
-
-        # loss_pc_amp_prior = F.smooth_l1_loss(
-        #     pc_amp,
-        #     amp_ref.detach(),
-        # )
         
-        loss_pc_amp_tv = (
-            (pc_amp[..., 1:, :] - pc_amp[..., :-1, :]).abs().mean()
-            + (pc_amp[..., :, 1:] - pc_amp[..., :, :-1]).abs().mean()
+        loss_idem = F.mse_loss(
+            second_pass_pred,
+            pred_detached,
+            reduction="none",
         )
-
-        w_pc_amp_prior = 0
-        w_pc_amp_tv = 0.001
         
-        trg_loss = loss_pc + (loss_idem * w_idem).mean() + (w_pc_amp_tv * loss_pc_amp_tv)
-        # trg_loss = loss_pc
+        w_idem = (1.0 - confidence).detach().clamp(min=0.1)
         
-        # Logging
-        self.log('loss_idem', loss_idem.mean(), on_step=True)
-        self.log('target_loss', trg_loss, on_step=True, logger=True)
-        self.log('debug/selection_mask_ratio', selection_mask.mean(), on_step=True, logger=True)
-        self.log("train/pc_amp_mean", pc_amp.mean())
-        self.log("train/pc_amp_std", pc_amp.std())
-        self.log("train/pc_amp_min", pc_amp.min())
-        self.log("train/pc_amp_max", pc_amp.max())
-        self.log("train/pc_amp_tv", loss_pc_amp_tv)
+        trg_loss = (
+            loss_pc
+            + (loss_idem * w_idem).mean()
+            + w_eff_var * loss_eff_var
+            + w_eff_mean * loss_eff_mean
+            + w_sigma_tv * loss_sigma_tv
+        )
+        
+        # -----------------------------------------------------------
+        # 2-12. Logging
+        # -----------------------------------------------------------
+        self.log("loss_idem", loss_idem.mean(), on_step=True)
+        self.log("target_loss", trg_loss, on_step=True, logger=True)
+        self.log("debug/selection_mask_ratio", selection_mask.mean(), on_step=True, logger=True)
+        
+        self.log("train/loss_eff_var", loss_eff_var, on_step=True, logger=True)
+        self.log("train/loss_eff_mean", loss_eff_mean, on_step=True, logger=True)
+        self.log("train/loss_sigma_tv", loss_sigma_tv, on_step=True, logger=True)
+        
+        self.log("train/sigma_pos_mean", sigma_pos.mean(), on_step=True, logger=True)
+        self.log("train/sigma_neg_mean", sigma_neg.mean(), on_step=True, logger=True)
+        self.log(
+            "train/sigma_asym_ratio",
+            sigma_pos.mean() / (sigma_neg.mean() + 1e-8),
+            on_step=True,
+            logger=True,
+        )
+        
+        self.log("train/sigma_min", torch.cat([sigma_pos, sigma_neg], dim=1).min(), on_step=True)
+        self.log("train/sigma_max", torch.cat([sigma_pos, sigma_neg], dim=1).max(), on_step=True)
+        
+        self.log("train/var_target_mean", var_target.mean(), on_step=True, logger=True)
+        self.log("train/gen_var_mean", gen_var.mean(), on_step=True, logger=True)
+        
+        with torch.no_grad():
+            sigma_mean_map = torch.cat([sigma_pos, sigma_neg], dim=1).mean(dim=1, keepdim=True)
+        
+            low_conf_mask = conf_smooth < 0.4
+            high_conf_mask = conf_smooth > 0.8
+        
+            if low_conf_mask.any():
+                self.log(
+                    "train/sigma_low_conf",
+                    sigma_mean_map[low_conf_mask].mean(),
+                    on_step=True,
+                    logger=True,
+                )
+        
+            if high_conf_mask.any():
+                self.log(
+                    "train/sigma_high_conf",
+                    sigma_mean_map[high_conf_mask].mean(),
+                    on_step=True,
+                    logger=True,
+                )
 
         # ===========================================================
         # 3. Source self-Supervised Loss
