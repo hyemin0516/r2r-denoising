@@ -282,6 +282,76 @@ class EffectiveNoiseDistributionEstimator(nn.Module):
 
         return sigma_pos, sigma_neg
 
+def highpass_detail(x, kernel_size=9):
+    """
+    x: [B, C, H, W]
+    local low-frequency를 제거한 detail component.
+    """
+    return x - avg_pool_reflect(x, kernel_size=kernel_size)
+
+
+def weighted_l1_loss(x, target, weight, eps=1e-8):
+    """
+    x, target: [B, C, H, W]
+    weight: [B, 1, H, W]
+    """
+    loss = (x - target).abs().mean(dim=1, keepdim=True)
+    return (loss * weight).sum() / (weight.sum() + eps)
+
+
+def build_teacher_structure_protect_map(
+    teacher_full,
+    teacher_pd,
+    conf_smooth=None,
+    detail_kernel=9,
+    smooth_kernel=7,
+):
+    """
+    teacher_full에는 남아있는데 teacher_pd에서 약해진 detail을
+    구조 보호 영역으로 사용.
+
+    return:
+        protect_map: [B, 1, H, W], 0~1
+    """
+
+    with torch.no_grad():
+        detail_full = highpass_detail(
+            teacher_full.detach(),
+            kernel_size=detail_kernel,
+        )
+
+        detail_pd = highpass_detail(
+            teacher_pd.detach(),
+            kernel_size=detail_kernel,
+        )
+
+        detail_full_mag = detail_full.abs().mean(dim=1, keepdim=True)
+        detail_pd_mag = detail_pd.abs().mean(dim=1, keepdim=True)
+
+        # full에는 강한데 pd에서는 약해진 detail
+        lost_detail = (detail_full_mag - detail_pd_mag).clamp(min=0.0)
+
+        # full/pd detail 자체가 다르게 보이는 영역
+        detail_disagree = (detail_full - detail_pd).abs().mean(dim=1, keepdim=True)
+
+        protect_map = 0.7 * lost_detail + 0.3 * detail_disagree
+
+        protect_map = avg_pool_reflect(
+            protect_map,
+            kernel_size=smooth_kernel,
+        )
+
+        protect_map = normalize_map_q95(protect_map)
+
+        # confidence가 낮은 곳은 구조/노이즈 ambiguity가 클 수 있으므로 약하게 boost
+        if conf_smooth is not None:
+            ambiguity = (1.0 - conf_smooth.detach()).clamp(0, 1)
+            protect_map = protect_map * (0.7 + 0.3 * ambiguity)
+
+        protect_map = protect_map.clamp(0, 1)
+
+    return protect_map
+
 
 class PD_GR2R(L.LightningModule):
     def __init__(self, config: DictConfig):
@@ -736,6 +806,20 @@ class PD_GR2R(L.LightningModule):
             mc_var = mc_stack.var(dim=0, unbiased=False).mean(dim=1, keepdim=True)
             mc_std = torch.sqrt(mc_var + 1e-8)
             mc_std_norm = normalize_map_q95(mc_std)
+
+            # -------------------------------------------------------
+            # Structure protection map
+            # -------------------------------------------------------
+            protect_map = build_teacher_structure_protect_map(
+                teacher_full=teacher_full,
+                teacher_pd=teacher_pd,
+                conf_smooth=conf_smooth,
+                detail_kernel=9,
+                smooth_kernel=7,
+            )
+            
+            # 구조가 강한 영역에서는 residual/discrepancy를 noise variance로 덜 해석
+            flat_weight = (1.0 - protect_map).clamp(min=0.2, max=1.0)
         
             # -------------------------------------------------------
             # 2-3. Teacher discrepancy / residual cues
@@ -763,9 +847,10 @@ class PD_GR2R(L.LightningModule):
         
             var_target = (
                 mc_var
-                + beta_pf * d_pf_var
-                + beta_res * r_full_var
+                + beta_pf * d_pf_var * flat_weight
+                + beta_res * r_full_var * flat_weight
             ).detach().clamp_min(1e-8)
+
         
             # -------------------------------------------------------
             # 2-4. Residual templates
@@ -1031,10 +1116,40 @@ class PD_GR2R(L.LightningModule):
             pad:pad + H,
             pad:pad + W,
         ]
+
+        detail_ref = highpass_detail(
+            teacher_full.detach(),
+            kernel_size=9,
+        )
         
+        detail_pc = highpass_detail(
+            matched_target,
+            kernel_size=9,
+        )
+        
+        struct_weight = protect_map.detach()
+        
+        # selection_mask가 의미 있게 생성되어 있으므로 같이 사용
+        struct_weight = struct_weight * selection_mask.detach()
+        
+        loss_pc_struct = weighted_l1_loss(
+            detail_pc,
+            detail_ref,
+            struct_weight,
+        )
         # target은 detach 유지.
         # estimator는 loss_eff_var / loss_eff_mean / loss_sigma_tv로 학습.
         patch_craft_target = matched_target.detach()
+
+        # -----------------------------------------------------------
+        # Structure-aware sigma suppression
+        # -----------------------------------------------------------
+        sigma_all = torch.cat([sigma_pos, sigma_neg], dim=1)
+        sigma_mean_map = sigma_all.mean(dim=1, keepdim=True)
+        
+        loss_sigma_struct = (
+            protect_map * sigma_mean_map
+        ).sum() / (protect_map.sum() + 1e-8)
         
         # -----------------------------------------------------------
         # 2-11. Target branch student loss
@@ -1067,6 +1182,9 @@ class PD_GR2R(L.LightningModule):
         )
         
         w_idem = (1.0 - confidence).detach().clamp(min=0.1)
+
+        w_sigma_struct = 0.0005
+        w_pc_struct = 0.05
         
         trg_loss = (
             loss_pc
@@ -1074,6 +1192,8 @@ class PD_GR2R(L.LightningModule):
             + w_eff_var * loss_eff_var
             + w_eff_mean * loss_eff_mean
             + w_sigma_tv * loss_sigma_tv
+            + w_sigma_struct * loss_sigma_struct
+            + w_pc_struct * loss_pc_struct
         )
         
         # -----------------------------------------------------------
